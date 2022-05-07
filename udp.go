@@ -52,7 +52,7 @@ func ReadFromSessionUDP(conn *net.UDPConn, b []byte) (int, *SessionUDP, error) {
 	// https://developers.cloudflare.com/spectrum/proxy-protocol#enabling-proxy-protocol-v2-for-tcpudp
 	MAGIC := []byte{'\x56', '\xec'}
 	// if we detect the MAGIC NUMBER, we have to call simple parser to set the client details
-	if len(n) >= 38 && bytes.Equal(b[:2], MAGIC[:2]) {
+	if n > 38 && bytes.Equal(b[:2], MAGIC[:2]) {
 		// make and copy to avoid us from having issues since we will have to replace the reference b later
 		proxy := make([]byte, 38)
 		copy(proxy, b[:38])
