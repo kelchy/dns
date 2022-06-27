@@ -3,6 +3,7 @@ package dns
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -17,7 +18,7 @@ func newTsig(algo string) *Msg {
 }
 
 func TestTsig(t *testing.T) {
-	m := newTsig(HmacMD5)
+	m := newTsig(HmacSHA256)
 	buf, _, err := TsigGenerate(m, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +30,7 @@ func TestTsig(t *testing.T) {
 
 	// TSIG accounts for ID substitution. This means if the message ID is
 	// changed by a forwarder, we should still be able to verify the TSIG.
-	m = newTsig(HmacMD5)
+	m = newTsig(HmacSHA256)
 	buf, _, err = TsigGenerate(m, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +44,7 @@ func TestTsig(t *testing.T) {
 }
 
 func TestTsigCase(t *testing.T) {
-	m := newTsig("HmAc-mD5.sig-ALg.rEg.int.") // HmacMD5
+	m := newTsig(strings.ToUpper(HmacSHA256))
 	buf, _, err := TsigGenerate(m, "pRZgBrBvI4NAHZYhxmhs/Q==", "", false)
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +63,7 @@ const (
 		"%012x" + // placeholder for the "time signed" field
 		"012c00208cf23e0081d915478a182edcea7ff48ad102948e6c7ef8e887536957d1fa5616c60000000000"
 	// A secret (in base64 format) with which the TSIG in wireMsg will be validated
-	testSecret        = "NoTCJU+DMqFWywaPyxSijrDEA/eC3nK0xi3AMEZuPVk="
+	testSecret = "NoTCJU+DMqFWywaPyxSijrDEA/eC3nK0xi3AMEZuPVk="
 	// the 'time signed' field value that would make the TSIG RR valid with testSecret
 	timeSigned uint64 = 1594855491
 )
@@ -79,23 +80,23 @@ func TestTsigErrors(t *testing.T) {
 	}
 
 	// the signature is valid but 'time signed' is too far from the "current time".
-	if err := tsigVerify(buildMsgData(timeSigned), testSecret, "", false, timeSigned+301); err != ErrTime {
+	if err := tsigVerify(buildMsgData(timeSigned), tsigHMACProvider(testSecret), "", false, timeSigned+301); err != ErrTime {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrTime, err)
 	}
-	if err := tsigVerify(buildMsgData(timeSigned), testSecret, "", false, timeSigned-301); err != ErrTime {
+	if err := tsigVerify(buildMsgData(timeSigned), tsigHMACProvider(testSecret), "", false, timeSigned-301); err != ErrTime {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrTime, err)
 	}
 
 	// the signature is invalid and 'time signed' is too far.
 	// the signature should be checked first, so we should see ErrSig.
-	if err := tsigVerify(buildMsgData(timeSigned+301), testSecret, "", false, timeSigned); err != ErrSig {
+	if err := tsigVerify(buildMsgData(timeSigned+301), tsigHMACProvider(testSecret), "", false, timeSigned); err != ErrSig {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrSig, err)
 	}
 
 	// tweak the algorithm name in the wire data, resulting in the "unknown algorithm" error.
 	msgData := buildMsgData(timeSigned)
 	copy(msgData[67:], "bogus")
-	if err := tsigVerify(msgData, testSecret, "", false, timeSigned); err != ErrKeyAlg {
+	if err := tsigVerify(msgData, tsigHMACProvider(testSecret), "", false, timeSigned); err != ErrKeyAlg {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrKeyAlg, err)
 	}
 
@@ -104,7 +105,7 @@ func TestTsigErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tsigVerify(msgData, testSecret, "", false, timeSigned); err != ErrNoSig {
+	if err := tsigVerify(msgData, tsigHMACProvider(testSecret), "", false, timeSigned); err != ErrNoSig {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrNoSig, err)
 	}
 
@@ -120,7 +121,7 @@ func TestTsigErrors(t *testing.T) {
 	if msgData, err = msg.Pack(); err != nil {
 		t.Fatal(err)
 	}
-	err = tsigVerify(msgData, testSecret, "", false, timeSigned)
+	err = tsigVerify(msgData, tsigHMACProvider(testSecret), "", false, timeSigned)
 	if err == nil || !strings.Contains(err.Error(), "overflow") {
 		t.Errorf("expected error to contain %q, but got %v", "overflow", err)
 	}
@@ -160,7 +161,7 @@ func TestTsigGenerate(t *testing.T) {
 			testTSIG.OtherData = tc.otherData
 			req := &Msg{
 				MsgHdr:   MsgHdr{Opcode: OpcodeUpdate},
-				Question: []Question{Question{Name: "example.com.", Qtype: TypeSOA, Qclass: ClassINET}},
+				Question: []Question{{Name: "example.com.", Qtype: TypeSOA, Qclass: ClassINET}},
 				Extra:    []RR{&testTSIG},
 			}
 
@@ -219,7 +220,7 @@ func TestTSIGHMAC224And384(t *testing.T) {
 			}
 			req := &Msg{
 				MsgHdr:   MsgHdr{Opcode: OpcodeUpdate},
-				Question: []Question{Question{Name: "example.com.", Qtype: TypeSOA, Qclass: ClassINET}},
+				Question: []Question{{Name: "example.com.", Qtype: TypeSOA, Qclass: ClassINET}},
 				Extra:    []RR{&tsig},
 			}
 
@@ -231,8 +232,121 @@ func TestTSIGHMAC224And384(t *testing.T) {
 			if mac != tc.expectedMAC {
 				t.Fatalf("MAC doesn't match: expected '%s' but got '%s'", tc.expectedMAC, mac)
 			}
-			if err = tsigVerify(msgData, tc.secret, "", false, timeSigned); err != nil {
+			if err = tsigVerify(msgData, tsigHMACProvider(tc.secret), "", false, timeSigned); err != nil {
 				t.Error(err)
+			}
+		})
+	}
+}
+
+const testGoodKeyName = "goodkey."
+
+var (
+	testErrBadKey = errors.New("this is an intentional error")
+	testGoodMAC   = []byte{0, 1, 2, 3}
+)
+
+// testProvider always generates the same MAC and only accepts the one signature
+type testProvider struct {
+	GenerateAllKeys bool
+}
+
+func (provider *testProvider) Generate(_ []byte, t *TSIG) ([]byte, error) {
+	if t.Hdr.Name == testGoodKeyName || provider.GenerateAllKeys {
+		return testGoodMAC, nil
+	}
+	return nil, testErrBadKey
+}
+
+func (*testProvider) Verify(_ []byte, t *TSIG) error {
+	if t.Hdr.Name == testGoodKeyName {
+		return nil
+	}
+	return testErrBadKey
+}
+
+func TestTsigGenerateProvider(t *testing.T) {
+	tables := []struct {
+		keyname string
+		mac     []byte
+		err     error
+	}{
+		{
+			testGoodKeyName,
+			testGoodMAC,
+			nil,
+		},
+		{
+			"badkey.",
+			nil,
+			testErrBadKey,
+		},
+	}
+
+	for _, table := range tables {
+		t.Run(table.keyname, func(t *testing.T) {
+			tsig := TSIG{
+				Hdr:        RR_Header{Name: table.keyname, Rrtype: TypeTSIG, Class: ClassANY, Ttl: 0},
+				Algorithm:  HmacSHA1,
+				TimeSigned: timeSigned,
+				Fudge:      300,
+				OrigId:     42,
+			}
+			req := &Msg{
+				MsgHdr:   MsgHdr{Opcode: OpcodeUpdate},
+				Question: []Question{{Name: "example.com.", Qtype: TypeSOA, Qclass: ClassINET}},
+				Extra:    []RR{&tsig},
+			}
+
+			_, mac, err := tsigGenerateProvider(req, new(testProvider), "", false)
+			if err != table.err {
+				t.Fatalf("error doesn't match: expected '%s' but got '%s'", table.err, err)
+			}
+			expectedMAC := hex.EncodeToString(table.mac)
+			if mac != expectedMAC {
+				t.Fatalf("MAC doesn't match: expected '%s' but got '%s'", table.mac, expectedMAC)
+			}
+		})
+	}
+}
+
+func TestTsigVerifyProvider(t *testing.T) {
+	tables := []struct {
+		keyname string
+		err     error
+	}{
+		{
+			testGoodKeyName,
+			nil,
+		},
+		{
+			"badkey.",
+			testErrBadKey,
+		},
+	}
+
+	for _, table := range tables {
+		t.Run(table.keyname, func(t *testing.T) {
+			tsig := TSIG{
+				Hdr:        RR_Header{Name: table.keyname, Rrtype: TypeTSIG, Class: ClassANY, Ttl: 0},
+				Algorithm:  HmacSHA1,
+				TimeSigned: timeSigned,
+				Fudge:      300,
+				OrigId:     42,
+			}
+			req := &Msg{
+				MsgHdr:   MsgHdr{Opcode: OpcodeUpdate},
+				Question: []Question{{Name: "example.com.", Qtype: TypeSOA, Qclass: ClassINET}},
+				Extra:    []RR{&tsig},
+			}
+
+			provider := &testProvider{true}
+			msgData, _, err := tsigGenerateProvider(req, provider, "", false)
+			if err != nil {
+				t.Error(err)
+			}
+			if err = tsigVerify(msgData, provider, "", false, timeSigned); err != table.err {
+				t.Fatalf("error doesn't match: expected '%s' but got '%s'", table.err, err)
 			}
 		})
 	}
