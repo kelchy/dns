@@ -3,6 +3,8 @@
 package dns
 
 import (
+	"bytes"
+	"encoding/binary"
 	"net"
 
 	"golang.org/x/net/ipv4"
@@ -30,6 +32,8 @@ var udpOOBSize = func() int {
 type SessionUDP struct {
 	raddr   *net.UDPAddr
 	context []byte
+	proxyHdr  []byte
+	proxyAddr *net.UDPAddr
 }
 
 // RemoteAddr returns the remote network address.
@@ -43,12 +47,46 @@ func ReadFromSessionUDP(conn *net.UDPConn, b []byte) (int, *SessionUDP, error) {
 	if err != nil {
 		return n, nil, err
 	}
-	return n, &SessionUDP{raddr, oob[:oobn]}, err
+
+	// MAGIC NUMBER of cloudflare's simple proxy
+	// https://developers.cloudflare.com/spectrum/proxy-protocol#enabling-proxy-protocol-v2-for-tcpudp
+	MAGIC := []byte{'\x56', '\xec'}
+	// if we detect the MAGIC NUMBER, we have to call simple parser to set the client details
+	if n > 38 && bytes.Equal(b[:2], MAGIC[:2]) {
+		// make and copy to avoid us from having issues since we will have to replace the reference b later
+		proxy := make([]byte, 38)
+		copy(proxy, b[:38])
+		// replacing without the simple proxy header prefix as if it was a normal dns query
+		copy(b, b[38:])
+		// fetch the actual client's IP from proxy header
+		clientIP := proxy[2:18]
+		// fetch the actual client's port from proxy header
+		clientPort := binary.BigEndian.Uint16(proxy[34:36])
+		// create a UDPAddr
+		sourceAddr := &net.UDPAddr{
+			IP:   net.IP(clientIP),
+			Port: int(clientPort),
+		}
+		// store the simple proxy header prefix in the struct for retrieval later when we reply
+		return n-38, &SessionUDP{sourceAddr, oob[:oobn], proxy, raddr}, err
+	}
+
+	return n, &SessionUDP{raddr, oob[:oobn], []byte{}, nil}, err
 }
 
 // WriteToSessionUDP acts just like net.UDPConn.WriteTo(), but uses a *SessionUDP instead of a net.Addr.
 func WriteToSessionUDP(conn *net.UDPConn, b []byte, session *SessionUDP) (int, error) {
 	oob := correctSource(session.context)
+
+	// if this request was made through cloudflare's simple proxy protocol, i.e. MAGIC NUMBER
+	// https://developers.cloudflare.com/spectrum/proxy-protocol#enabling-proxy-protocol-v2-for-tcpudp
+	if len(session.proxyHdr) > 0 {
+		// prefix the original header so cloudflare can verify the source and route accordingly
+		b = append(session.proxyHdr, b...)
+		n, _, err := conn.WriteMsgUDP(b, oob, session.proxyAddr)
+		return n, err
+	}
+
 	n, _, err := conn.WriteMsgUDP(b, oob, session.raddr)
 	return n, err
 }
